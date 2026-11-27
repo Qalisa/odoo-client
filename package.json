@@ -1,6 +1,6 @@
 {
   "name": "@qalisa/odoo-client",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Typed client for an Odoo server's JSON-RPC API (formerly @qalisa/odoo-cli)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
