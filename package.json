@@ -1,7 +1,7 @@
 {
-  "name": "@qalisa/odoo-cli",
-  "version": "1.0.1",
-  "description": "Allows interacting with a server's Odoo RPC API",
+  "name": "@qalisa/odoo-client",
+  "version": "1.1.0",
+  "description": "Typed client for an Odoo server's JSON-RPC API (formerly @qalisa/odoo-cli)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
@@ -16,7 +16,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "pnpm run build"
+    "prepublishOnly": "pnpm run build",
+    "test": "pnpm run build && node --test test/client.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
@@ -31,5 +32,8 @@
   ],
   "author": "Qalisa",
   "license": "MIT",
-  "packageManager": "pnpm@10.8.0+sha512.0e82714d1b5b43c74610193cb20734897c1d00de89d0e18420aebc5977fa13d780a9cb05734624e81ebd81cc876cd464794850641c48b9544326b5622ca29971"
+  "packageManager": "pnpm@10.8.0+sha512.0e82714d1b5b43c74610193cb20734897c1d00de89d0e18420aebc5977fa13d780a9cb05734624e81ebd81cc876cd464794850641c48b9544326b5622ca29971",
+  "engines": {
+    "node": ">=20"
+  }
 }

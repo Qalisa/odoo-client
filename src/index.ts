@@ -60,3 +60,8 @@ export const connectOdooCliSync = async (params: Parameters<typeof getConnectedO
 export const getOdooCliSync = () => {
   return cli;
 } 
+
+export { default as OdooJSONRpc } from "./cli.js";
+export type { OdooClientOptions } from "./cli.js";
+export * from "./errors.js";
+export type * from "./types.js";
