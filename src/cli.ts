@@ -10,7 +10,29 @@ import type {
   OdooSearchReadOptions,
   PrimitiveOrObject,
 } from "./types.js";
+import {
+  OdooAuthenticationError,
+  OdooExternalIdNotFound,
+  OdooRpcError,
+  OdooTransportError,
+} from "./errors.js";
 import { Try, isCredentialsResponse } from "./utils.js";
+
+export type OdooClientOptions = {
+  /** Replaces the global fetch, e.g. in tests. */
+  fetch?: typeof fetch;
+  /** Gives up on a call after this many milliseconds. Defaults to 30 000. */
+  timeoutMs?: number;
+};
+
+type JsonRpcResponse<T> = {
+  result?: T;
+  error?: {
+    code?: number;
+    message?: string;
+    data?: { name?: string; message?: string; debug?: string };
+  };
+};
 
 export default class OdooJSONRpc {
   public is_connected = false;
@@ -24,11 +46,13 @@ export default class OdooJSONRpc {
   private _config: OdooConnection;
   private _session_id: string | undefined;
   private _api_key: string | undefined;
+  private _fetch: typeof fetch;
+  private _timeoutMs: number;
 
   //Initializes the OdooJSONRpc instance with the provided configuration.
   private _initialize() {
     if (!this._config.baseUrl || !this._config.db) {
-      throw new Error(
+      throw new TypeError(
         "Incomplete configuration. Please at least provide baseUrl and db",
       );
     }
@@ -56,152 +80,124 @@ export default class OdooJSONRpc {
   //
   //
 
-  //Connects to the Odoo server using an API key.
-  private async _connectWithApiKey() {
-    //
-    const config = this._config as ConnectionWithApiKeyCredentials;
-
-    //
-    const endpoint = `${this.url}/jsonrpc`;
-    const params = {
-      jsonrpc: "2.0",
-      method: "call",
-      params: {
-        service: "common",
-        method: "authenticate",
-        args: [config.db, config.username, config.apiKey, {}],
-      },
-      id: new Date().getTime(),
-    };
-    const [response, auth_error] = await Try(() =>
-      fetch(endpoint, {
+  //Sends one JSON-RPC request and returns its result, or throws a typed error.
+  private async _post<T>(
+    path: string,
+    params: FObject,
+    headers: Record<string, string> = {},
+  ): Promise<{ result: T; response: Response }> {
+    const [response, request_error] = await Try(() =>
+      this._fetch(`${this.url}${path}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(params),
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "call",
+          params,
+          id: Date.now(),
+        }),
+        signal: AbortSignal.timeout(this._timeoutMs),
       }),
     );
-    if (auth_error) {
-      throw auth_error;
+    if (request_error) {
+      throw new OdooTransportError(
+        `Odoo did not answer ${path}: ${request_error.message}`,
+        undefined,
+        { cause: request_error },
+      );
     }
     if (!response.ok) {
-      throw new Error(response.statusText);
+      throw new OdooTransportError(
+        `Odoo answered ${path} with HTTP ${response.status} ${response.statusText}`,
+        response.status,
+      );
     }
-    const [body, body_parse_error] = await Try(() => response.json());
+    const [body, body_parse_error] = await Try(
+      () => response.json() as Promise<JsonRpcResponse<T>>,
+    );
     if (body_parse_error) {
-      throw body_parse_error;
+      throw new OdooTransportError(
+        `Odoo answered ${path} with something that is not JSON`,
+        response.status,
+        { cause: body_parse_error },
+      );
     }
-    const { result, odoo_error } = body;
-    if (odoo_error) {
-      throw new Error(body?.error?.data?.message);
+    if (body.error) {
+      throw new OdooRpcError(
+        body.error.data?.message ?? body.error.message ?? "Odoo error",
+        body.error.data?.name,
+        body.error.code,
+        body.error.data?.debug,
+      );
+    }
+    return { result: body.result as T, response };
+  }
+
+  private _sessionHeaders(): Record<string, string> {
+    if (!this._session_id) {
+      throw new OdooAuthenticationError(
+        "No Odoo session. Call connect() first.",
+      );
+    }
+    return {
+      "X-Openerp-Session-Id": this._session_id,
+      Cookie: `session_id=${this._session_id}`,
+    };
+  }
+
+  //Connects to the Odoo server using an API key.
+  private async _connectWithApiKey() {
+    const config = this._config as ConnectionWithApiKeyCredentials;
+    const { result } = await this._post<number | false>("/jsonrpc", {
+      service: "common",
+      method: "authenticate",
+      args: [config.db, config.username, config.apiKey, {}],
+    });
+    if (typeof result !== "number") {
+      throw new OdooAuthenticationError(
+        `Odoo refused the API key of ${config.username} on database ${config.db}`,
+      );
     }
     this._uid = result;
     const out: OdooAuthenticateWithApiKeyResponse = { uid: result };
     return out;
   }
+
   //Connects to the Odoo server using username and password credentials.
   private async _connectWithCredentials() {
-    //
     const config = this._config as ConnectionWithPasswordCredentials;
-
-    //
-    const endpoint = `${this.url}/web/session/authenticate`;
-    const params = {
-      jsonrpc: "2.0",
-      method: "call",
-      params: {
-        db: config.db,
-        login: config.username,
-        password: config.password,
-      },
-      id: new Date().getTime(),
-    };
-    const [response, auth_error] = await Try(() =>
-      fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(params),
-      }),
-    );
-    if (auth_error) {
-      throw auth_error;
-    }
-    if (!response.ok) {
-      throw new Error(response.statusText);
-    }
-    const [body, body_parse_error] = await Try(() => response.json());
-    if (body_parse_error) {
-      throw body_parse_error;
-    }
-    const { result, odoo_error, error } = body;
-    if (odoo_error || error) {
-      throw new Error(body?.error?.data?.message);
-    }
-    const cookies = response.headers.get("set-cookie");
-    if (!cookies) {
-      throw new Error(
-        "Cookie not found in response headers, please check your credentials",
+    const { result, response } =
+      await this._post<OdooAuthenticateWithCredentialsResponse>(
+        "/web/session/authenticate",
+        { db: config.db, login: config.username, password: config.password },
+      );
+    const sessionId = response.headers
+      .get("set-cookie")
+      ?.split(";")
+      .find((cookie) => cookie.trim().startsWith("session_id="))
+      ?.split("=")[1];
+    if (!result?.uid || !sessionId) {
+      throw new OdooAuthenticationError(
+        `Odoo refused the password of ${config.username} on database ${config.db}`,
       );
     }
-    if (!cookies.includes("session_id")) {
-      throw new Error("session_id not found in cookies");
-    }
-    const sessionId = cookies
-      .split(";")
-      .find((cookie) => cookie.includes("session_id"))!
-      .split("=")[1];
     this._session_id = sessionId;
     this._auth_response = result;
-    return result as OdooAuthenticateWithCredentialsResponse;
+    return result;
   }
 
   //Connects to the Odoo server using an existing session ID.
   private async _connectWithSessionId() {
-    const endpoint = `${this.url}/web/session/get_session_info`;
-    const params = {
-      jsonrpc: "2.0",
-      method: "call",
-      params: {},
-      id: new Date().getTime(),
-    };
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    if (this._session_id) {
-      headers["X-Openerp-Session-Id"] = this._session_id;
-      headers["Cookie"] = `session_id=${this._session_id}`;
-    } else {
-      throw new Error("session_id not found. Please connect first.");
-    }
-    const [response, auth_error] = await Try(() =>
-      fetch(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(params),
-      }),
+    const { result } = await this._post<OdooAuthenticateWithCredentialsResponse>(
+      "/web/session/get_session_info",
+      {},
+      this._sessionHeaders(),
     );
-    if (auth_error) {
-      throw auth_error;
-    }
-    if (!response.ok) {
-      throw new Error(response.statusText);
-    }
-    const [body, body_parse_error] = await Try(() => response.json());
-    if (body_parse_error) {
-      throw body_parse_error;
-    }
-    const { result, odoo_error } = body;
-    if (odoo_error) {
-      throw new Error(body?.error?.data?.message);
+    if (!result?.uid) {
+      throw new OdooAuthenticationError("The Odoo session has expired.");
     }
     this._auth_response = result;
-
-    //
-    return result as OdooAuthenticateWithCredentialsResponse;
+    return result;
   }
 
   //Calls a method on the Odoo server using UID and API key authentication.
@@ -211,50 +207,20 @@ export default class OdooJSONRpc {
     args: PrimitiveOrObject[],
     kwargs: FObject = {},
   ) {
-    const endpoint = `${this.url}/jsonrpc`;
-    const params = {
-      jsonrpc: "2.0",
-      method: "call",
-      params: {
-        service: "object",
-        method: "execute_kw",
-        args: [
-          this._config.db,
-          this._uid,
-          this._api_key,
-          model,
-          method,
-          args,
-          kwargs,
-        ],
-      },
-      id: new Date().getTime(),
-    };
-    const headers = {
-      "Content-Type": "application/json",
-    };
-    const [response, request_error] = await Try(() =>
-      fetch(endpoint, {
-        headers,
-        method: "POST",
-        body: JSON.stringify(params),
-      }),
-    );
-    if (request_error) {
-      throw request_error;
-    }
-    if (!response.ok) {
-      throw new Error(response.statusText);
-    }
-    const [body, body_parse_error] = await Try(() => response.json());
-    if (body_parse_error) {
-      throw body_parse_error;
-    }
-    const { result, error } = body;
-    if (error) {
-      throw new Error(body?.error?.data?.message);
-    }
-    return result as T;
+    const { result } = await this._post<T>("/jsonrpc", {
+      service: "object",
+      method: "execute_kw",
+      args: [
+        this._config.db,
+        this._uid ?? null,
+        this._api_key ?? null,
+        model,
+        method,
+        args,
+        kwargs,
+      ],
+    });
+    return result;
   }
 
   //Calls a method on the Odoo server using session ID authentication.
@@ -264,57 +230,22 @@ export default class OdooJSONRpc {
     args: PrimitiveOrObject[],
     kwargs: FObject = {},
   ) {
-    const endpoint = `${this.url}/web/dataset/call_kw`;
-    const params = {
-      jsonrpc: "2.0",
-      method: "call",
-      params: {
-        model,
-        method,
-        args,
-        kwargs,
-      },
-      id: new Date().getTime(),
-    };
-
-    //
-    const headers: HeadersInit = new Headers({
-      "Content-Type": "application/json",
-      Cookie: `session_id=${this._session_id}`,
-    });
-    headers.set("X-Openerp-Session-Id", this._session_id ?? "");
-
-    //
-    const [response, request_error] = await Try(() =>
-      fetch(endpoint, {
-        headers,
-        method: "POST",
-        body: JSON.stringify(params),
-      }),
+    const { result } = await this._post<T>(
+      "/web/dataset/call_kw",
+      { model, method, args, kwargs },
+      this._sessionHeaders(),
     );
-    if (request_error) {
-      throw request_error;
-    }
-    if (!response.ok) {
-      throw new Error(response.statusText);
-    }
-    const [body, body_parse_error] = await Try(() => response.json());
-    if (body_parse_error) {
-      throw body_parse_error;
-    }
-    const { result, error } = body;
-    if (error) {
-      throw new Error(body?.error?.data?.message);
-    }
-    return result as T;
+    return result;
   }
 
   //
   //
   //
 
-  constructor(config: OdooConnection) {
+  constructor(config: OdooConnection, options: OdooClientOptions = {}) {
     this._config = config;
+    this._fetch = options.fetch ?? globalThis.fetch;
+    this._timeoutMs = options.timeoutMs ?? 30_000;
     this._initialize();
   }
 
@@ -343,9 +274,6 @@ export default class OdooJSONRpc {
         ? this._connectWithApiKey()
         : this._connectWithCredentials());
 
-    if (!result) {
-      throw new Error("Authentication failed. Please check your credentials.");
-    }
 
     //
     if (!isCredentialsResponse(result)) {
@@ -378,7 +306,9 @@ export default class OdooJSONRpc {
     }
 
     this.is_connected = false;
-    throw new Error("Please connect with credentials or api key first.");
+    throw new OdooAuthenticationError(
+      "Not connected to Odoo. Connect with a password, an API key or a session.",
+    );
   }
 
   //Creates a new record in the specified Odoo model.
@@ -472,19 +402,31 @@ export default class OdooJSONRpc {
     ]);
   }
 
+  //Finds the ir.model.data row of an external ID, written `module.name` or just `name`.
+  private async _externalId(externalId: string) {
+    const dot = externalId.indexOf(".");
+    const domain =
+      dot === -1
+        ? [["name", "=", externalId]]
+        : [
+            ["module", "=", externalId.slice(0, dot)],
+            ["name", "=", externalId.slice(dot + 1)],
+          ];
+    const [row] = await this.searchRead<{ res_id: number; model: string }>(
+      "ir.model.data",
+      domain,
+      ["res_id", "model"],
+      { limit: 1 },
+    );
+    if (!row) {
+      throw new OdooExternalIdNotFound(externalId);
+    }
+    return row;
+  }
+
   //Searches for a record by its external ID.
   async searchByExternalId(externalId: string) {
-    const irModelData = await this.searchRead(
-      "ir.model.data",
-      [["name", "=", externalId]],
-      ["res_id"],
-    );
-    if (!irModelData.length) {
-      throw new Error(
-        `No matching record found for external identifier ${externalId}`,
-      );
-    }
-    return irModelData[0]["res_id"] as number;
+    return (await this._externalId(externalId)).res_id;
   }
 
   //Reads a record by its external ID.
@@ -492,102 +434,25 @@ export default class OdooJSONRpc {
     externalId: string,
     fields: string[] = [],
   ): Promise<T> {
-    const irModelData = await this.searchRead(
-      "ir.model.data",
-      [["name", "=", externalId]],
-      ["res_id", "model"],
-    );
-    if (!irModelData.length) {
-      throw new Error(
-        `No matching record found for external identifier ${externalId}`,
-      );
-    }
-    return (
-      await this.read<FObject>(
-        irModelData[0].model as string,
-        [irModelData[0].res_id as number],
-        fields,
-      )
-    )[0] as T;
+    const { model, res_id } = await this._externalId(externalId);
+    return (await this.read<T[]>(model, [res_id], fields))[0] as T;
   }
 
   //Updates a record by its external ID.
   async updateByExternalId(externalId: string, params: FObject = {}) {
-    const irModelData = await this.searchRead(
-      "ir.model.data",
-      [["name", "=", externalId]],
-      ["res_id", "model"],
-    );
-    if (!irModelData.length) {
-      throw new Error(
-        `No matching record found for external identifier ${externalId}`,
-      );
-    }
-    return await this.update(
-      irModelData[0].model as string,
-      irModelData[0].res_id as number,
-      params,
-    );
+    const { model, res_id } = await this._externalId(externalId);
+    return await this.update(model, res_id, params);
   }
 
   //Deletes a record by its external ID.
   async deleteByExternalId(externalId: string) {
-    const irModelData = await this.searchRead(
-      "ir.model.data",
-      [["name", "=", externalId]],
-      ["res_id", "model"],
-    );
-    if (!irModelData.length) {
-      throw new Error(`No matching record found for external ID ${externalId}`);
-    }
-    return await this.delete(
-      irModelData[0].model as string,
-      irModelData[0].res_id as number,
-    );
+    const { model, res_id } = await this._externalId(externalId);
+    return await this.delete(model, res_id);
   }
 
   //Disconnects from the Odoo server
   async disconnect() {
-    const endpoint = `${this.url}/web/session/destroy`;
-    const params = {
-      jsonrpc: "2.0",
-      method: "call",
-      params: {},
-      id: new Date().getTime(),
-    };
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    if (this._session_id) {
-      headers["X-Openerp-Session-Id"] = this._session_id;
-      headers["Cookie"] = `session_id=${this._session_id}`;
-    } else {
-      throw new Error("session_id not found. Please connect first.");
-    }
-
-    const [response, auth_error] = await Try(() =>
-      fetch(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(params),
-      }),
-    );
-
-    if (auth_error) {
-      throw auth_error;
-    }
-    if (!response.ok) {
-      throw new Error(response.statusText);
-    }
-    const [body, body_parse_error] = await Try(() => response.json());
-    if (body_parse_error) {
-      throw body_parse_error;
-    }
-    const { error } = body;
-    if (error) {
-      throw new Error(body?.error?.data?.message);
-    }
+    await this._post("/web/session/destroy", {}, this._sessionHeaders());
     this.is_connected = false;
     this._auth_response = undefined;
     this._uid = undefined;
